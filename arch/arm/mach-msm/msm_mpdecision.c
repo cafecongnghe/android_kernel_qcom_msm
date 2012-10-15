@@ -126,6 +126,7 @@ static struct hp_latency hp_latencies;
 
 static unsigned long last_nr;
 static int num_present_hundreds;
+static ktime_t last_down_time;
 
 static bool ok_to_update_tz(int nr, int last_nr)
 {
@@ -382,14 +383,15 @@ restart:
 			}
 		}
 
-		for_each_possible_cpu(cpu) {
-			if (!(atomic_read(&msm_mpd.algo_cpu_mask) & (1 << cpu))
-				&& cpu_online(cpu)) {
-				bring_down_cpu(cpu);
-				if (!cpu_online(cpu))
-					goto restart;
-			}
-		}
+		if (ktime_to_ns(ktime_sub(ktime_get(), last_down_time)) >
+		    100 * NSEC_PER_MSEC)
+			for_each_possible_cpu(cpu)
+				if (!(atomic_read(&msm_mpd.algo_cpu_mask) &
+				      (1 << cpu)) && cpu_online(cpu)) {
+					bring_down_cpu(cpu);
+					last_down_time = ktime_get();
+					break;
+				}
 		msm_mpd.hpupdate = HPUPDATE_WAITING;
 	}
 
