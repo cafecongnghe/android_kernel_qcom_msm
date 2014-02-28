@@ -79,6 +79,7 @@
 #if defined(CONFIG_DEBUG_FS)
 static void msmsdcc_dbg_createhost(struct msmsdcc_host *);
 static struct dentry *debugfs_dir;
+static struct dentry *debugfs_file;
 static int  msmsdcc_dbg_init(void);
 #endif
 
@@ -894,10 +895,6 @@ static bool msmsdcc_is_dma_possible(struct msmsdcc_host *host,
 	bool ret = true;
 	u32 xfer_size = data->blksz * data->blocks;
 
-	if (host->enforce_pio_mode) {
-		ret = false;
-		goto out;
-	}
 	if (is_sps_mode(host)) {
 		/*
 		 * BAM Mode: Fall back on PIO if size is less
@@ -916,7 +913,7 @@ static bool msmsdcc_is_dma_possible(struct msmsdcc_host *host,
 		/* PIO Mode */
 		ret = false;
 	}
- out:
+
 	return ret;
 }
 
@@ -1183,16 +1180,15 @@ msmsdcc_start_command_deferred(struct msmsdcc_host *host,
 	if (mmc_cmd_type(cmd) == MMC_CMD_ADTC)
 		*c |= MCI_CSPM_DATCMD;
 
-	/* Check if AUTO CMD19/CMD21 is required or not? */
+	/* Check if AUTO CMD19 is required or not? */
 	if (host->tuning_needed &&
-		(host->en_auto_cmd19 || host->en_auto_cmd21)) {
+		!(host->mmc->ios.timing == MMC_TIMING_MMC_HS200)) {
+
 		/*
 		 * For open ended block read operation (without CMD23),
-		 * AUTO_CMD19/AUTO_CMD21 bit should be set while sending
-		 * the READ command.
+		 * AUTO_CMD19 bit should be set while sending the READ command.
 		 * For close ended block read operation (with CMD23),
-		 * AUTO_CMD19/AUTO_CMD21 bit should be set while sending
-		 * CMD23.
+		 * AUTO_CMD19 bit should be set while sending CMD23.
 		 */
 		if ((cmd->opcode == MMC_SET_BLOCK_COUNT &&
 			host->curr.mrq->cmd->opcode ==
@@ -1201,12 +1197,7 @@ msmsdcc_start_command_deferred(struct msmsdcc_host *host,
 			(cmd->opcode == MMC_READ_SINGLE_BLOCK ||
 			cmd->opcode == MMC_READ_MULTIPLE_BLOCK))) {
 			msmsdcc_enable_cdr_cm_sdc4_dll(host);
-			if (host->en_auto_cmd19 &&
-			    host->mmc->ios.timing == MMC_TIMING_UHS_SDR104)
-				*c |= MCI_CSPM_AUTO_CMD19;
-			else if (host->en_auto_cmd21 &&
-			    host->mmc->ios.timing == MMC_TIMING_MMC_HS200)
-				*c |= MCI_CSPM_AUTO_CMD21;
+			*c |= MCI_CSPM_AUTO_CMD19;
 		}
 	}
 
@@ -1381,11 +1372,9 @@ msmsdcc_data_err(struct msmsdcc_host *host, struct mmc_data *data,
 		 */
 		if (!(data->mrq->cmd->opcode == MMC_BUS_TEST_W
 			|| data->mrq->cmd->opcode == MMC_BUS_TEST_R)) {
-			pr_err("%s: CMD%d: Data timeout. DAT0 => %d\n",
+			pr_err("%s: CMD%d: Data timeout\n",
 				 mmc_hostname(host->mmc),
-				 data->mrq->cmd->opcode,
-				 (readl_relaxed(host->base
-				 + MCI_TEST_INPUT) & 0x2) ? 1 : 0);
+				 data->mrq->cmd->opcode);
 			data->error = -ETIMEDOUT;
 			msmsdcc_dump_sdcc_state(host);
 		}
@@ -1835,7 +1824,7 @@ msmsdcc_irq(int irq, void *dev_id)
 				 */
 				wake_lock(&host->sdio_wlock);
 			} else {
-				if (mmc->card && !mmc_card_sdio(mmc->card)) {
+				if (!mmc->card || !mmc_card_sdio(mmc->card)) {
 					WARN(1, "%s: SDCC core interrupt received for non-SDIO cards when SDCC clocks are off\n",
 					     mmc_hostname(mmc));
 					ret = 1;
@@ -1869,7 +1858,7 @@ msmsdcc_irq(int irq, void *dev_id)
 #endif
 
 		if (status & MCI_SDIOINTROPE) {
-			if (mmc->card && !mmc_card_sdio(mmc->card)) {
+			if (!mmc->card || mmc_card_sdio(mmc->card)) {
 				WARN(1, "%s: SDIO interrupt received for non-SDIO card\n",
 					mmc_hostname(mmc));
 				ret = 1;
@@ -3430,10 +3419,10 @@ static void msmsdcc_print_rpm_info(struct msmsdcc_host *host)
 {
 	struct device *dev = mmc_dev(host->mmc);
 
-	pr_err("%s: PM: sdcc_suspended=%d, pending_resume=%d, sdcc_suspending=%d\n",
+	pr_info("%s: PM: sdcc_suspended=%d, pending_resume=%d, sdcc_suspending=%d\n",
 		mmc_hostname(host->mmc), host->sdcc_suspended,
 		host->pending_resume, host->sdcc_suspending);
-	pr_err("%s: RPM: runtime_status=%d, usage_count=%d,"
+	pr_info("%s: RPM: runtime_status=%d, usage_count=%d,"
 		" is_suspended=%d, disable_depth=%d, runtime_error=%d,"
 		" request_pending=%d, request=%d\n",
 		mmc_hostname(host->mmc), dev->power.runtime_status,
@@ -3520,7 +3509,6 @@ static int msmsdcc_enable(struct mmc_host *mmc)
 {
 	struct device *dev = mmc->parent;
 	struct msmsdcc_host *host = mmc_priv(mmc);
-	unsigned long flags;
 	int rc = 0;
 
 	msmsdcc_pm_qos_update_latency(host, 1);
@@ -3554,7 +3542,6 @@ out:
 static int msmsdcc_disable(struct mmc_host *mmc)
 {
 	struct msmsdcc_host *host = mmc_priv(mmc);
-	unsigned long flags;
 	int rc = 0;
 
 	msmsdcc_pm_qos_update_latency(host, 0);
@@ -4860,7 +4847,7 @@ show_idle_timeout(struct device *dev, struct device_attribute *attr,
 	struct msmsdcc_host *host = mmc_priv(mmc);
 
 	return snprintf(buf, PAGE_SIZE, "%u (Min 5 sec)\n",
-		host->idle_tout / 1000);
+		host->idle_tout_ms / 1000);
 }
 
 static ssize_t
@@ -4875,66 +4862,9 @@ store_idle_timeout(struct device *dev, struct device_attribute *attr,
 	if (!kstrtou32(buf, 0, &timeout)
 			&& (timeout > MSM_MMC_DEFAULT_IDLE_TIMEOUT / 1000)) {
 		spin_lock_irqsave(&host->lock, flags);
-		host->idle_tout = timeout * 1000;
+		host->idle_tout_ms = timeout * 1000;
 		spin_unlock_irqrestore(&host->lock, flags);
 	}
-	return count;
-}
-
-static inline void set_auto_cmd_setting(struct device *dev,
-					 const char *buf,
-					 bool is_cmd19)
-{
-	struct mmc_host *mmc = dev_get_drvdata(dev);
-	struct msmsdcc_host *host = mmc_priv(mmc);
-	unsigned int long flags;
-	int temp;
-
-	if (!kstrtou32(buf, 0, &temp)) {
-		spin_lock_irqsave(&host->lock, flags);
-		if (is_cmd19)
-			host->en_auto_cmd19 = !!temp;
-		else
-			host->en_auto_cmd21 = !!temp;
-		spin_unlock_irqrestore(&host->lock, flags);
-	}
-}
-
-static ssize_t
-show_enable_auto_cmd19(struct device *dev, struct device_attribute *attr,
-		       char *buf)
-{
-	struct mmc_host *mmc = dev_get_drvdata(dev);
-	struct msmsdcc_host *host = mmc_priv(mmc);
-
-	return snprintf(buf, PAGE_SIZE, "%d\n", host->en_auto_cmd19);
-}
-
-static ssize_t
-store_enable_auto_cmd19(struct device *dev, struct device_attribute *attr,
-			const char *buf, size_t count)
-{
-	set_auto_cmd_setting(dev, buf, true);
-
-	return count;
-}
-
-static ssize_t
-show_enable_auto_cmd21(struct device *dev, struct device_attribute *attr,
-		       char *buf)
-{
-	struct mmc_host *mmc = dev_get_drvdata(dev);
-	struct msmsdcc_host *host = mmc_priv(mmc);
-
-	return snprintf(buf, PAGE_SIZE, "%d\n", host->en_auto_cmd21);
-}
-
-static ssize_t
-store_enable_auto_cmd21(struct device *dev, struct device_attribute *attr,
-			const char *buf, size_t count)
-{
-	set_auto_cmd_setting(dev, buf, false);
-
 	return count;
 }
 
@@ -4973,10 +4903,10 @@ static void msmsdcc_print_regs(const char *name, void __iomem *base,
 	if (!base)
 		return;
 
-	pr_err("===== %s: Register Dumps @phys_base=0x%x, @virt_base=0x%x"
+	pr_info("===== %s: Register Dumps @phys_base=0x%x, @virt_base=0x%x"
 		" =====\n", name, phys_base, (u32)base);
 	for (i = 0; i < no_of_regs; i = i + 4) {
-		pr_err("Reg=0x%.2x: 0x%.8x, 0x%.8x, 0x%.8x, 0x%.8x\n", i*4,
+		pr_info("Reg=0x%.2x: 0x%.8x, 0x%.8x, 0x%.8x, 0x%.8x\n", i*4,
 			(u32)readl_relaxed(base + i*4),
 			(u32)readl_relaxed(base + ((i+1)*4)),
 			(u32)readl_relaxed(base + ((i+2)*4)),
@@ -4987,29 +4917,25 @@ static void msmsdcc_print_regs(const char *name, void __iomem *base,
 static void msmsdcc_dump_sdcc_state(struct msmsdcc_host *host)
 {
 	/* Dump current state of SDCC clocks, power and irq */
-	pr_err("%s: SDCC PWR is %s\n", mmc_hostname(host->mmc),
+	pr_info("%s: SDCC PWR is %s\n", mmc_hostname(host->mmc),
 		(host->pwr ? "ON" : "OFF"));
-	pr_err("%s: SDCC clks are %s, MCLK rate=%d\n",
+	pr_info("%s: SDCC clks are %s, MCLK rate=%d\n",
 		mmc_hostname(host->mmc),
 		(atomic_read(&host->clks_on) ? "ON" : "OFF"),
 		(u32)clk_get_rate(host->clk));
-	pr_err("%s: SDCC irq is %s\n", mmc_hostname(host->mmc),
+	pr_info("%s: SDCC irq is %s\n", mmc_hostname(host->mmc),
 		(host->sdcc_irq_disabled ? "disabled" : "enabled"));
 
 	/* Now dump SDCC registers. Don't print FIFO registers */
-	if (atomic_read(&host->clks_on)) {
+	if (atomic_read(&host->clks_on))
 		msmsdcc_print_regs("SDCC-CORE", host->base,
 				   host->core_memres->start, 28);
-		pr_err("%s: MCI_TEST_INPUT = 0x%.8x\n",
-			mmc_hostname(host->mmc),
-			readl_relaxed(host->base + MCI_TEST_INPUT));
-	}
 
 	if (host->curr.data) {
 		if (!msmsdcc_is_dma_possible(host, host->curr.data))
-			pr_err("%s: PIO mode\n", mmc_hostname(host->mmc));
+			pr_info("%s: PIO mode\n", mmc_hostname(host->mmc));
 		else if (is_dma_mode(host))
-			pr_err("%s: ADM mode: busy=%d, chnl=%d, crci=%d\n",
+			pr_info("%s: ADM mode: busy=%d, chnl=%d, crci=%d\n",
 				mmc_hostname(host->mmc), host->dma.busy,
 				host->dma.channel, host->dma.crci);
 		else if (is_sps_mode(host)) {
@@ -5017,18 +4943,14 @@ static void msmsdcc_dump_sdcc_state(struct msmsdcc_host *host)
 				msmsdcc_print_regs("SDCC-DML", host->dml_base,
 						   host->dml_memres->start,
 						   16);
-			pr_err("%s: SPS mode: busy=%d\n",
+			pr_info("%s: SPS mode: busy=%d\n",
 				mmc_hostname(host->mmc), host->sps.busy);
 		}
 
-		pr_err("%s: xfer_size=%d, data_xfered=%d, xfer_remain=%d\n",
+		pr_info("%s: xfer_size=%d, data_xfered=%d, xfer_remain=%d\n",
 			mmc_hostname(host->mmc), host->curr.xfer_size,
 			host->curr.data_xfered, host->curr.xfer_remain);
 	}
-
-	if (host->sps.reset_bam)
-		pr_err("%s: SPS BAM reset failed: sps reset_bam=%d\n",
-			mmc_hostname(host->mmc), host->sps.reset_bam);
 
 	if (host->sps.reset_bam)
 		pr_err("%s: SPS BAM reset failed: sps reset_bam=%d\n",
@@ -5319,9 +5241,7 @@ static void msmsdcc_dt_get_cd_wp_gpio(struct device *dev,
 	pdata->status_gpio = of_get_named_gpio_flags(np,
 			"cd-gpios", 0, &flags);
 	if (gpio_is_valid(pdata->status_gpio)) {
-		struct platform_device *pdev = container_of(dev,
-						struct platform_device, dev);
-		pdata->status_irq = platform_get_irq_byname(pdev, "status_irq");
+		pdata->status_irq = gpio_to_irq(pdata->status_gpio);
 		pdata->is_status_gpio_active_low = flags & OF_GPIO_ACTIVE_LOW;
 	}
 
@@ -5863,8 +5783,10 @@ msmsdcc_probe(struct platform_device *pdev)
 		mmc->caps |= (MMC_CAP_SET_XPC_330 | MMC_CAP_SET_XPC_300 |
 				MMC_CAP_SET_XPC_180);
 
-	mmc->caps2 |= MMC_CAP2_PACKED_WR;
-	mmc->caps2 |= MMC_CAP2_PACKED_WR_CONTROL;
+
+	/* packed write */
+	mmc->caps2 |= plat->packed_write;
+
 	mmc->caps2 |= (MMC_CAP2_BOOTPART_NOACC | MMC_CAP2_DETECT_ON_ERR);
 	mmc->caps2 |= MMC_CAP2_SANITIZE;
 	mmc->caps2 |= MMC_CAP2_INIT_BKOPS;
@@ -6010,7 +5932,7 @@ msmsdcc_probe(struct platform_device *pdev)
 		pm_runtime_enable(&(pdev)->dev);
 	}
 #endif
-	host->idle_tout = MSM_MMC_DEFAULT_IDLE_TIMEOUT;
+	host->idle_tout_ms = MSM_MMC_DEFAULT_IDLE_TIMEOUT;
 	setup_timer(&host->req_tout_timer, msmsdcc_req_tout_timer_hdlr,
 			(unsigned long)host);
 
@@ -6090,42 +6012,8 @@ msmsdcc_probe(struct platform_device *pdev)
 	ret = device_create_file(&pdev->dev, &host->idle_timeout);
 	if (ret)
 		goto remove_polling_file;
-
-	if (!is_auto_cmd19(host))
-		goto add_auto_cmd21_atrr;
-
-	/* Sysfs entry for AUTO CMD19 control */
-	host->auto_cmd19_attr.show = show_enable_auto_cmd19;
-	host->auto_cmd19_attr.store = store_enable_auto_cmd19;
-	sysfs_attr_init(&host->auto_cmd19_attr.attr);
-	host->auto_cmd19_attr.attr.name = "enable_auto_cmd19";
-	host->auto_cmd19_attr.attr.mode = S_IRUGO | S_IWUSR;
-	ret = device_create_file(&pdev->dev, &host->auto_cmd19_attr);
-	if (ret)
-		goto remove_idle_timeout_file;
-
- add_auto_cmd21_atrr:
-	if (!is_auto_cmd21(host))
-		goto exit;
-
-	/* Sysfs entry for AUTO CMD21 control */
-	host->auto_cmd21_attr.show = show_enable_auto_cmd21;
-	host->auto_cmd21_attr.store = store_enable_auto_cmd21;
-	sysfs_attr_init(&host->auto_cmd21_attr.attr);
-	host->auto_cmd21_attr.attr.name = "enable_auto_cmd21";
-	host->auto_cmd21_attr.attr.mode = S_IRUGO | S_IWUSR;
-	ret = device_create_file(&pdev->dev, &host->auto_cmd21_attr);
-	if (ret)
-		goto remove_auto_cmd19_attr_file;
-
- exit:
 	return 0;
 
- remove_auto_cmd19_attr_file:
-	if (is_auto_cmd19(host))
-		device_remove_file(&pdev->dev, &host->auto_cmd19_attr);
- remove_idle_timeout_file:
-	device_remove_file(&pdev->dev, &host->idle_timeout);
  remove_polling_file:
 	if (!plat->status_irq)
 		device_remove_file(&pdev->dev, &host->polling);
@@ -6189,16 +6077,6 @@ msmsdcc_probe(struct platform_device *pdev)
 	return ret;
 }
 
-#ifdef CONFIG_DEBUG_FS
-static void msmsdcc_remove_debugfs(struct msmsdcc_host *host)
-{
-	debugfs_remove_recursive(host->debugfs_host_dir);
-	host->debugfs_host_dir = NULL;
-}
-#else
-static void msmsdcc_remove_debugfs(msmsdcc_host *host) {}
-#endif
-
 static int msmsdcc_remove(struct platform_device *pdev)
 {
 	struct mmc_host *mmc = mmc_get_drvdata(pdev);
@@ -6216,16 +6094,10 @@ static int msmsdcc_remove(struct platform_device *pdev)
 	DBG(host, "Removing SDCC device = %d\n", pdev->id);
 	plat = host->plat;
 
-	if (is_auto_cmd19(host))
-		device_remove_file(&pdev->dev, &host->auto_cmd19_attr);
-	if (is_auto_cmd21(host))
-		device_remove_file(&pdev->dev, &host->auto_cmd21_attr);
 	device_remove_file(&pdev->dev, &host->max_bus_bw);
 	if (!plat->status_irq)
 		device_remove_file(&pdev->dev, &host->polling);
 	device_remove_file(&pdev->dev, &host->idle_timeout);
-
-	msmsdcc_remove_debugfs(host);
 
 	del_timer_sync(&host->req_tout_timer);
 	tasklet_kill(&host->dma_tlet);
@@ -6403,23 +6275,6 @@ static inline void msmsdcc_ungate_clock(struct msmsdcc_host *host)
 }
 #endif
 
-#if CONFIG_DEBUG_FS
-static void msmsdcc_print_pm_stats(struct msmsdcc_host *host, ktime_t start,
-		const char *func)
-{
-	ktime_t diff;
-
-	if (host->print_pm_stats) {
-		diff = ktime_sub(ktime_get(), start);
-		pr_info("%s: %s: Completed in %llu usec\n", func,
-		mmc_hostname(host->mmc), (u64)ktime_to_us(diff));
-	}
-}
-#else
-static void msmsdcc_print_pm_stats(struct msmsdcc_host *host, ktime_t start,
-		const char *func) {}
-#endif
-
 static int
 msmsdcc_runtime_suspend(struct device *dev)
 {
@@ -6427,7 +6282,6 @@ msmsdcc_runtime_suspend(struct device *dev)
 	struct msmsdcc_host *host = mmc_priv(mmc);
 	int rc = 0;
 	unsigned long flags;
-	ktime_t start = ktime_get();
 
 	if (host->plat->is_sdio_al_client) {
 		rc = 0;
@@ -6484,7 +6338,6 @@ msmsdcc_runtime_suspend(struct device *dev)
 out:
 	/* set bus bandwidth to 0 immediately */
 	msmsdcc_msm_bus_cancel_work_and_set_vote(host, NULL);
-	msmsdcc_print_pm_stats(host, start, __func__);
 	return rc;
 }
 
@@ -6494,10 +6347,9 @@ msmsdcc_runtime_resume(struct device *dev)
 	struct mmc_host *mmc = dev_get_drvdata(dev);
 	struct msmsdcc_host *host = mmc_priv(mmc);
 	unsigned long flags;
-	ktime_t start = ktime_get();
 
 	if (host->plat->is_sdio_al_client)
-		goto out;
+		return 0;
 
 	pr_debug("%s: %s: start\n", mmc_hostname(mmc), __func__);
 	if (mmc) {
@@ -6532,8 +6384,6 @@ msmsdcc_runtime_resume(struct device *dev)
 	}
 	host->pending_resume = false;
 	pr_debug("%s: %s: end\n", mmc_hostname(mmc), __func__);
-out:
-	msmsdcc_print_pm_stats(host, start, __func__);
 	return 0;
 }
 
@@ -6546,7 +6396,7 @@ static int msmsdcc_runtime_idle(struct device *dev)
 		return 0;
 
 	/* Idle timeout is not configurable for now */
-	pm_schedule_suspend(dev, host->idle_tout);
+	pm_schedule_suspend(dev, host->idle_tout_ms);
 
 	return -EAGAIN;
 }
@@ -6556,19 +6406,17 @@ static int msmsdcc_pm_suspend(struct device *dev)
 	struct mmc_host *mmc = dev_get_drvdata(dev);
 	struct msmsdcc_host *host = mmc_priv(mmc);
 	int rc = 0;
-	ktime_t start = ktime_get();
 
-	if (host->plat->is_sdio_al_client) {
-		rc = 0;
-		goto out;
-	}
+	if (host->plat->is_sdio_al_client)
+		return 0;
+
+
 	if (host->plat->status_irq)
 		disable_irq(host->plat->status_irq);
 
 	if (!pm_runtime_suspended(dev))
 		rc = msmsdcc_runtime_suspend(dev);
- out:
-	msmsdcc_print_pm_stats(host, start, __func__);
+
 	return rc;
 }
 
@@ -6601,12 +6449,10 @@ static int msmsdcc_pm_resume(struct device *dev)
 	struct mmc_host *mmc = dev_get_drvdata(dev);
 	struct msmsdcc_host *host = mmc_priv(mmc);
 	int rc = 0;
-	ktime_t start = ktime_get();
 
-	if (host->plat->is_sdio_al_client) {
-		rc = 0;
-		goto out;
-	}
+	if (host->plat->is_sdio_al_client)
+		return 0;
+
 	if (mmc->card && mmc_card_sdio(mmc->card))
 		rc = msmsdcc_runtime_resume(dev);
 	/*
@@ -6622,8 +6468,7 @@ static int msmsdcc_pm_resume(struct device *dev)
 		msmsdcc_check_status((unsigned long)host);
 		enable_irq(host->plat->status_irq);
 	}
-out:
-	msmsdcc_print_pm_stats(host, start, __func__);
+
 	return rc;
 }
 
@@ -6697,6 +6542,7 @@ static void __exit msmsdcc_exit(void)
 	platform_driver_unregister(&msmsdcc_driver);
 
 #if defined(CONFIG_DEBUG_FS)
+	debugfs_remove(debugfs_file);
 	debugfs_remove(debugfs_dir);
 #endif
 }
@@ -6708,128 +6554,59 @@ MODULE_DESCRIPTION("Qualcomm Multimedia Card Interface driver");
 MODULE_LICENSE("GPL");
 
 #if defined(CONFIG_DEBUG_FS)
-static int msmsdcc_dbg_idle_tout_get(void *data, u64 *val)
-{
-	struct msmsdcc_host *host = data;
 
-	*val = host->idle_tout / 1000L;
+static int
+msmsdcc_dbg_state_open(struct inode *inode, struct file *file)
+{
+	file->private_data = inode->i_private;
 	return 0;
 }
 
-static int msmsdcc_dbg_idle_tout_set(void *data, u64 val)
+static ssize_t
+msmsdcc_dbg_state_read(struct file *file, char __user *ubuf,
+		       size_t count, loff_t *ppos)
 {
-	struct msmsdcc_host *host = data;
-	unsigned long flags;
+	struct msmsdcc_host *host = (struct msmsdcc_host *) file->private_data;
+	char buf[200];
+	int max, i;
 
-	spin_lock_irqsave(&host->lock, flags);
-	host->idle_tout = (u32)val * 1000;
-	spin_unlock_irqrestore(&host->lock, flags);
+	i = 0;
+	max = sizeof(buf) - 1;
 
-	return 0;
+	i += scnprintf(buf + i, max - i, "STAT: %p %p %p\n", host->curr.mrq,
+		       host->curr.cmd, host->curr.data);
+	if (host->curr.cmd) {
+		struct mmc_command *cmd = host->curr.cmd;
+
+		i += scnprintf(buf + i, max - i, "CMD : %.8x %.8x %.8x\n",
+			      cmd->opcode, cmd->arg, cmd->flags);
+	}
+	if (host->curr.data) {
+		struct mmc_data *data = host->curr.data;
+		i += scnprintf(buf + i, max - i,
+			      "DAT0: %.8x %.8x %.8x %.8x %.8x %.8x\n",
+			      data->timeout_ns, data->timeout_clks,
+			      data->blksz, data->blocks, data->error,
+			      data->flags);
+		i += scnprintf(buf + i, max - i, "DAT1: %.8x %.8x %.8x %p\n",
+			      host->curr.xfer_size, host->curr.xfer_remain,
+			      host->curr.data_xfered, host->dma.sg);
+	}
+
+	return simple_read_from_buffer(ubuf, count, ppos, buf, i);
 }
 
-DEFINE_SIMPLE_ATTRIBUTE(msmsdcc_dbg_idle_tout_ops,
-			msmsdcc_dbg_idle_tout_get,
-			msmsdcc_dbg_idle_tout_set,
-			"%llu\n");
-
-static int msmsdcc_dbg_pio_mode_get(void *data, u64 *val)
-{
-	struct msmsdcc_host *host = data;
-
-	*val = (u64) host->enforce_pio_mode;
-	return 0;
-}
-
-static int msmsdcc_dbg_pio_mode_set(void *data, u64 val)
-{
-	struct msmsdcc_host *host = data;
-	unsigned long flags;
-
-	spin_lock_irqsave(&host->lock, flags);
-	host->enforce_pio_mode = !!val;
-	spin_unlock_irqrestore(&host->lock, flags);
-
-	return 0;
-}
-
-DEFINE_SIMPLE_ATTRIBUTE(msmsdcc_dbg_pio_mode_ops,
-			msmsdcc_dbg_pio_mode_get,
-			msmsdcc_dbg_pio_mode_set,
-			"%llu\n");
-
-static int msmsdcc_dbg_pm_stats_get(void *data, u64 *val)
-{
-	struct msmsdcc_host *host = data;
-
-	*val = !!host->print_pm_stats;
-	return 0;
-}
-
-static int msmsdcc_dbg_pm_stats_set(void *data, u64 val)
-{
-	struct msmsdcc_host *host = data;
-	unsigned long flags;
-
-	spin_lock_irqsave(&host->lock, flags);
-	host->print_pm_stats = !!val;
-	spin_unlock_irqrestore(&host->lock, flags);
-
-	return 0;
-}
-
-DEFINE_SIMPLE_ATTRIBUTE(msmsdcc_dbg_pm_stats_ops,
-			msmsdcc_dbg_pm_stats_get,
-			msmsdcc_dbg_pm_stats_set,
-			"%llu\n");
+static const struct file_operations msmsdcc_dbg_state_ops = {
+	.read	= msmsdcc_dbg_state_read,
+	.open	= msmsdcc_dbg_state_open,
+};
 
 static void msmsdcc_dbg_createhost(struct msmsdcc_host *host)
 {
-	int err = 0;
-
-	if (!debugfs_dir)
-		return;
-
-	host->debugfs_host_dir = debugfs_create_dir(
-			mmc_hostname(host->mmc), debugfs_dir);
-	if (IS_ERR(host->debugfs_host_dir)) {
-		err = PTR_ERR(host->debugfs_host_dir);
-		host->debugfs_host_dir = NULL;
-		pr_err("%s: Failed to create debugfs dir for host with err=%d\n",
-			mmc_hostname(host->mmc), err);
-		return;
-	}
-
-	host->debugfs_idle_tout = debugfs_create_file("idle_tout",
-		S_IRUSR | S_IWUSR, host->debugfs_host_dir, host,
-		&msmsdcc_dbg_idle_tout_ops);
-
-	if (IS_ERR(host->debugfs_idle_tout)) {
-		err = PTR_ERR(host->debugfs_idle_tout);
-		host->debugfs_idle_tout = NULL;
-		pr_err("%s: Failed to create idle_tout debugfs entry with err=%d\n",
-			mmc_hostname(host->mmc), err);
-	}
-
-	host->debugfs_pio_mode = debugfs_create_file("pio_mode",
-		S_IRUSR | S_IWUSR, host->debugfs_host_dir, host,
-		&msmsdcc_dbg_pio_mode_ops);
-
-	if (IS_ERR(host->debugfs_pio_mode)) {
-		err = PTR_ERR(host->debugfs_pio_mode);
-		host->debugfs_pio_mode = NULL;
-		pr_err("%s: Failed to create pio_mode debugfs entry with err=%d\n",
-			mmc_hostname(host->mmc), err);
-	}
-
-	host->debugfs_pm_stats = debugfs_create_file("pm_stats",
-		S_IRUSR | S_IWUSR, host->debugfs_host_dir, host,
-		&msmsdcc_dbg_pm_stats_ops);
-	if (IS_ERR(host->debugfs_pm_stats)) {
-		err = PTR_ERR(host->debugfs_pm_stats);
-		host->debugfs_pm_stats = NULL;
-		pr_err("%s: Failed to create pm_stats debugfs entry with err=%d\n",
-			mmc_hostname(host->mmc), err);
+	if (debugfs_dir) {
+		debugfs_file = debugfs_create_file(mmc_hostname(host->mmc),
+							0644, debugfs_dir, host,
+							&msmsdcc_dbg_state_ops);
 	}
 }
 
@@ -6837,7 +6614,7 @@ static int __init msmsdcc_dbg_init(void)
 {
 	int err;
 
-	debugfs_dir = debugfs_create_dir("msm_sdcc", 0);
+	debugfs_dir = debugfs_create_dir("msmsdcc", 0);
 	if (IS_ERR(debugfs_dir)) {
 		err = PTR_ERR(debugfs_dir);
 		debugfs_dir = NULL;
