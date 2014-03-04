@@ -194,6 +194,9 @@ static void venc_cb(u32 event, u32 status, void *info, u32 size, void *handle,
 			break;
 		}
 
+		if (frame_data->flags & VCD_FRAME_FLAG_CODECCONFIG)
+			vbuf->v4l2_buf.flags |= V4L2_QCOM_BUF_FLAG_CODECCONFIG;
+
 		vbuf->v4l2_buf.timestamp =
 			ns_to_timeval(frame_data->time_stamp * NSEC_PER_USEC);
 
@@ -2199,7 +2202,7 @@ static long venc_free_recon_buffers(struct v4l2_subdev *sd, void *arg)
 			if (rc)
 				WFD_MSG_ERR("Failed to free recon buffer\n");
 
-			if (IS_ERR_OR_NULL(
+			if (!IS_ERR_OR_NULL(
 				client_ctx->recon_buffer_ion_handle[i])) {
 				if (!inst->secure) {
 					ion_unmap_iommu(
